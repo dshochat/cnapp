@@ -63,10 +63,11 @@ def load_vuln_map(path: str) -> Dict[str, List[dict]]:
     """
     Load vulnerability_map.json.
 
-    Returns a dict keyed by the *basename* of each entry's filename so that
-    lookup is O(1) and works regardless of whether the sensor reports absolute
-    or relative paths.  Multiple vulnerabilities for the same file are
-    preserved as a list.
+    Entries whose file_path is a bare filename (e.g. "server_mock.py") are
+    indexed under that name.  Entries with an absolute path are indexed under
+    BOTH the full path and the basename so that lookups succeed regardless of
+    how the sensor reports the path.  Multiple vulns per key are preserved as
+    a list.
     """
     try:
         with open(path, "r") as fh:
@@ -78,9 +79,16 @@ def load_vuln_map(path: str) -> Dict[str, List[dict]]:
 
     index: Dict[str, List[dict]] = {}
     for entry in data.get("vulnerability_map", []):
-        key = os.path.basename(entry.get("filename", "")).strip()
-        if key:
-            index.setdefault(key, []).append(entry)
+        file_path = entry.get("file_path", "").strip()
+        if not file_path:
+            continue
+        # Always index by full file_path value (bare name or absolute path)
+        index.setdefault(file_path, []).append(entry)
+        # Also index by basename so a full-path event matches a bare-name entry
+        # and vice-versa.  Skip if basename == file_path (already added above).
+        basename = os.path.basename(file_path)
+        if basename != file_path:
+            index.setdefault(basename, []).append(entry)
 
     return index
 
@@ -95,7 +103,7 @@ def print_alert(event: dict, vuln: dict) -> None:
     sev   = vuln.get("severity", "UNKNOWN").upper()
     color = SEVERITY_COLOR.get(sev, C.WHITE)
     ts    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cve   = vuln.get("mock_cve", "UNKNOWN")
+    cve   = vuln.get("cve_id", "UNKNOWN")
 
     print(_bar(color))
     print(f"{C.BOLD}{color}  !! CNAPP ALERT  —  {cve}  !!{C.RESET}")
@@ -104,15 +112,10 @@ def print_alert(event: dict, vuln: dict) -> None:
     print(f"  {C.BOLD}Severity   :{C.RESET} {C.BOLD}{color}{sev}{C.RESET}")
     print(f"  {C.BOLD}CVE ID     :{C.RESET} {C.BOLD}{cve}{C.RESET}")
     print(f"  {C.BOLD}Type       :{C.RESET} {vuln.get('type', 'N/A')}")
-    print(f"  {C.BOLD}File       :{C.RESET} {event.get('filepath', 'N/A')}  "
-          f"(line {vuln.get('line_number', '?')})")
+    print(f"  {C.BOLD}File       :{C.RESET} {event.get('filepath', 'N/A')}")
     print(f"  {C.BOLD}Process    :{C.RESET} {event.get('process', '?')}  "
           f"(PID {event.get('pid', '?')})")
     print(f"  {C.BOLD}Description:{C.RESET} {vuln.get('description', 'N/A')}")
-    if vuln.get("endpoint"):
-        print(f"  {C.BOLD}Endpoint   :{C.RESET} {vuln['endpoint']}"
-              f"  [param: {vuln.get('parameter', '?')}]")
-    print(f"  {C.BOLD}Fix        :{C.RESET} {vuln.get('fix', 'N/A')}")
     print(_bar(color))
     print()
 
@@ -149,8 +152,21 @@ def handle_client(conn: socket.socket, vuln_index: Dict[str, List[dict]]) -> Non
                 filepath = event.get("filepath", "")
                 basename = os.path.basename(filepath)
 
-                if basename in vuln_index:
-                    for vuln in vuln_index[basename]:
+                # Check both the full path and the basename so that entries
+                # recorded as bare filenames still match absolute-path events
+                # and vice-versa.  Deduplicate by cve_id to avoid firing the
+                # same alert twice when both keys point to the same entry.
+                seen: set = set()
+                matches = []
+                for key in (filepath, basename):
+                    for vuln in vuln_index.get(key, []):
+                        cve = vuln.get("cve_id", "")
+                        if cve not in seen:
+                            seen.add(cve)
+                            matches.append(vuln)
+
+                if matches:
+                    for vuln in matches:
                         print_alert(event, vuln)
                 elif VERBOSE:
                     ts = datetime.now().strftime("%H:%M:%S")
