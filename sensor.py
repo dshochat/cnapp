@@ -60,9 +60,11 @@ SOCKET_PATH: str = "/tmp/cnapp_brain.sock"
 #   PARM3 → flags
 #
 # On kernels with CONFIG_ARCH_HAS_SYSCALL_WRAPPER (x86-64 >= 4.17) the real
-# entry point is a thin wrapper whose only argument is `struct pt_regs *regs`.
-# BCC's get_syscall_fnname() returns the correct symbol, and PT_REGS_PARM2
-# still resolves to the right register (rsi) for the original syscall args.
+# entry point __x64_sys_openat(struct pt_regs *regs) is a thin wrapper whose
+# ONLY argument is a pointer to the user pt_regs.  PT_REGS_PARM2(ctx) would
+# read the wrong register (the 2nd arg of the wrapper, which doesn't exist).
+# We must follow PARM1 to get the inner pt_regs, then read ->si which holds
+# the pathname (rsi = 2nd syscall argument in the x86-64 calling convention).
 #
 BPF_SOURCE = r"""
 #include <uapi/linux/ptrace.h>
@@ -83,7 +85,15 @@ int trace_openat(struct pt_regs *ctx)
 {
     struct event_t ev = {};
 
-    const char __user *pathname = (const char __user *)PT_REGS_PARM2(ctx);
+    /*
+     * __x64_sys_openat is a syscall wrapper: its only argument is a pointer
+     * to the pt_regs that holds the real syscall args.
+     *   PT_REGS_PARM1(ctx)  →  pointer to inner pt_regs
+     *   inner_regs->si      →  rsi = pathname (2nd syscall arg)
+     */
+    struct pt_regs *inner_regs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+    const char __user *pathname = NULL;
+    bpf_probe_read_kernel(&pathname, sizeof(pathname), &inner_regs->si);
 
     ev.pid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
